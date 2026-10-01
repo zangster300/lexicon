@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+
+# usage:
+#   download             install nvim
+#   download -f, -force  reinstall even if VERSION is present
+#
+# env:
+#   VERSION   release tag, e.g. v0.12.5 or nightly, blank for latest stable
+#   CHECKSUM  sha256, blank to look up for VERSION
+#   URL       archive url, blank for github releases
+#
+# sources:
+#   https://github.com/neovim/neovim/releases
+
+set -euo pipefail
+
+# ---- config ---------------------------------------------------------------
+
+VERSION="${VERSION:-}"
+CHECKSUM="${CHECKSUM:-}"
+BUILD=""
+ARCH="${ARCH:-arm64}"
+case "$(uname -s)" in
+Darwin) OS="macos" ;;
+Linux) OS="linux" ;;
+*) OS="$(uname -s)" ;;
+esac
+
+INSTALL_PATH="${INSTALL_PATH:-/opt/nvim}"
+BIN_PATH="${BIN_PATH:-/usr/local/bin}"
+MAN_PATH="${MAN_PATH:-/usr/local/share/man/man1}"
+URL="${URL:-}"
+RELEASES_API="${RELEASES_API:-https://api.github.com/repos/neovim/neovim/releases}"
+
+# ---- helpers --------------------------------------------------------------
+
+step() { printf "==> %s\n" "$*"; }
+die() {
+  printf "error: %s\n" "$*" >&2
+  exit 1
+}
+
+sha256() {
+  if command -v sha256sum >/dev/null; then
+    sha256sum "$1"
+  else
+    shasum -a 256 "$1"
+  fi | awk '{print $1}'
+}
+
+WORK_DIR="$(mktemp -d)"
+trap 'sudo rm -rf "$WORK_DIR"' EXIT
+
+# ---- steps ----------------------------------------------------------------
+
+check_prereqs() {
+  command -v sudo >/dev/null || die "sudo required"
+  command -v curl >/dev/null || die "curl required"
+}
+
+# fills blank VERSION/CHECKSUM from github; BUILD comes from the release notes
+lookup() {
+  command -v jq >/dev/null || die "jq required unless VERSION and CHECKSUM are set"
+  step "resolving ${VERSION:-latest} for $OS-$ARCH"
+  local api="$RELEASES_API/latest" entry sum
+  [ -z "$VERSION" ] || api="$RELEASES_API/tags/$VERSION"
+  entry="$(curl -fsSL --retry 3 "$api" | jq -er --arg n "nvim-$OS-$ARCH.tar.gz" '
+    .tag_name as $t | (((.body // "") | capture("NVIM (?<b>v\\S+)").b) // $t) as $b
+    | .assets[] | select(.name == $n) | [$t, $b, .digest // "none"] | @tsv')" ||
+    die "no ${VERSION:-release} found for $OS-$ARCH"
+  IFS=$'\t' read -r VERSION BUILD sum <<<"$entry"
+  [ "$sum" != none ] || [ -n "$CHECKSUM" ] || die "$VERSION has no checksum, set CHECKSUM"
+  CHECKSUM="${CHECKSUM:-$sum}"
+}
+
+resolve() {
+  [ -n "$VERSION" ] && [ -n "$CHECKSUM" ] || lookup
+  BUILD="${BUILD:-$VERSION}"
+  URL="${URL:-https://github.com/neovim/neovim/releases/download/$VERSION/nvim-$OS-$ARCH.tar.gz}"
+  TARBALL="$WORK_DIR/${URL##*/}"
+}
+
+# exact first line, so v0.12.0 doesn't match v0.12.0-dev
+already_installed() {
+  local out
+  [ -x "$INSTALL_PATH/bin/nvim" ] || return 1
+  out="$("$INSTALL_PATH/bin/nvim" -v 2>/dev/null)" || return 1
+  [ "${out%%$'\n'*}" = "NVIM $BUILD" ]
+}
+
+download() {
+  step "downloading $URL"
+  curl -fsSL --retry 3 -o "$TARBALL" "$URL"
+}
+
+verify() {
+  step "verifying checksum"
+  local expected actual
+  expected="$CHECKSUM"
+  expected="${expected#sha256:}"
+  actual="$(sha256 "$TARBALL")"
+  [ "$actual" = "$expected" ] || die "checksum mismatch
+  expected $expected
+  actual   $actual"
+}
+
+extract() {
+  step "extracting"
+  mkdir "$WORK_DIR/nvim"
+  sudo tar -xzf "$TARBALL" -C "$WORK_DIR/nvim" --strip-components=1
+  [ -x "$WORK_DIR/nvim/bin/nvim" ] || die "archive did not contain bin/nvim"
+}
+
+install() {
+  step "installing to $INSTALL_PATH"
+  sudo rm -rf "$INSTALL_PATH"
+  sudo mkdir -p "$(dirname "$INSTALL_PATH")"
+  sudo mv "$WORK_DIR/nvim" "$INSTALL_PATH"
+  sudo chown -R 0:0 "$INSTALL_PATH"
+}
+
+link() {
+  step "linking into $BIN_PATH"
+  sudo mkdir -p "$BIN_PATH" "$MAN_PATH"
+  sudo ln -sfn "$INSTALL_PATH/bin/nvim" "$BIN_PATH/nvim"
+  sudo ln -sfn "$INSTALL_PATH/share/man/man1/nvim.1" "$MAN_PATH/nvim.1"
+}
+
+# ---- main -----------------------------------------------------------------
+
+force=false
+for arg in "$@"; do
+  case "$arg" in
+  -f | -force) force=true ;;
+  *) die "unknown flag $arg" ;;
+  esac
+done
+
+check_prereqs
+resolve
+
+if ! "$force" && already_installed; then
+  step "$BUILD already installed at $INSTALL_PATH"
+  exit 0
+fi
+
+download
+verify
+extract
+install
+link
+
+step "done: $BUILD at $INSTALL_PATH"
